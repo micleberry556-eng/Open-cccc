@@ -68,15 +68,8 @@ RUN mix release
 FROM ${RUNNER_IMAGE}
 
 RUN apt-get update -y && \
-  apt-get install -y \
-    libstdc++6 openssl libncurses5 locales ca-certificates \
-    curl tini \
-    python3 python3-pip python3-venv \
+  apt-get install -y libstdc++6 openssl libncurses5 locales ca-certificates \
   && apt-get clean && rm -f /var/lib/apt/lists/*_*
-
-# Install commonly-used Python libraries for agent scripts.
-RUN pip3 install --no-cache-dir --break-system-packages \
-    requests httpx beautifulsoup4 pandas numpy pyyaml jinja2
 
 # Set the locale
 RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
@@ -86,10 +79,6 @@ ENV LANGUAGE en_US:en
 ENV LC_ALL en_US.UTF-8
 
 WORKDIR "/app"
-
-# Create workspace directory (bind-mounted from host via docker-compose).
-RUN mkdir -p /workspace && chown nobody:nogroup /workspace
-
 RUN chown nobody /app
 
 # set runner ENV
@@ -100,8 +89,10 @@ COPY --from=builder --chown=nobody:root /app/_build/${MIX_ENV}/rel/nexora ./
 
 USER nobody
 
-# tini reaps zombie processes spawned by agent shell commands.
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# If using an environment that doesn't automatically reap zombie processes, it is
+# advised to add an init process such as tini via `apt-get install`
+# above and adding an entrypoint. See https://github.com/krallin/tini for details
+# ENTRYPOINT ["/tini", "--"]
 
 EXPOSE 4000
 

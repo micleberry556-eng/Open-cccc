@@ -56,15 +56,39 @@ log = logging.getLogger("agent_runner")
 SYSTEM_PROMPT = textwrap.dedent("""\
     You are an expert software engineer. The user will give you a task
     description (technical specification). You must produce ALL source files
-    needed to build and run the project.
+    needed to build, test, and run the project.
 
-    Rules:
-    - Return ONLY a JSON array of file objects. No markdown, no explanation.
-    - Each object: {"path": "relative/file.py", "content": "...file content..."}
-    - Include a README.md with build/run instructions.
-    - Include tests when possible.
-    - Include a Makefile or equivalent build script.
-    - Use best practices for the chosen language.
+    RESPONSE FORMAT — CRITICAL:
+    Return ONLY a raw JSON array. No markdown fences, no explanation, no text
+    before or after the JSON. The response must start with [ and end with ].
+
+    Each element is an object with exactly two keys:
+      {"path": "relative/path/to/file.py", "content": "...full file content..."}
+
+    EXAMPLE (Python project):
+    [
+      {"path": "requirements.txt", "content": "fastapi>=0.100.0\\nuvicorn>=0.23.0\\npytest>=7.0.0\\n"},
+      {"path": "main.py", "content": "from fastapi import FastAPI\\n\\napp = FastAPI()\\n\\n@app.get('/')\\ndef root():\\n    return {'status': 'ok'}\\n"},
+      {"path": "test_main.py", "content": "from fastapi.testclient import TestClient\\nfrom main import app\\n\\nclient = TestClient(app)\\n\\ndef test_root():\\n    r = client.get('/')\\n    assert r.status_code == 200\\n"},
+      {"path": "README.md", "content": "# My App\\n\\n## Install\\npip install -r requirements.txt\\n\\n## Run\\nuvicorn main:app\\n\\n## Test\\npytest\\n"}
+    ]
+
+    MANDATORY FILES by language:
+    - Python:     requirements.txt (all dependencies with versions), tests (test_*.py)
+    - JavaScript: package.json (with scripts.test defined), tests
+    - TypeScript:  package.json (with scripts.test and tsconfig.json), tests
+    - Go:         go.mod (with module name), *_test.go files
+
+    RULES:
+    - Every project MUST have tests. No exceptions.
+    - Every project MUST have a README.md with install/run/test instructions.
+    - Pin dependency versions (e.g., fastapi>=0.100.0, not just fastapi).
+    - Use only well-known, stable libraries.
+    - Write clean, well-commented code following best practices.
+    - Do NOT use placeholder or stub implementations — write real, working code.
+    - For Python: use if __name__ == "__main__" guard in entry points.
+    - For Go: set module name to "project" in go.mod.
+    - Escape special characters properly in JSON string values.
 """)
 
 FIX_PROMPT_TEMPLATE = textwrap.dedent("""\
@@ -74,12 +98,18 @@ FIX_PROMPT_TEMPLATE = textwrap.dedent("""\
     {errors}
     ```
 
-    Here are the current files:
+    Here are the files that need fixing:
 
     {files_json}
 
-    Fix ALL errors and return the complete updated file list as a JSON array.
-    Return ONLY the JSON array, no markdown, no explanation.
+    INSTRUCTIONS:
+    1. Analyze each error carefully.
+    2. Fix ALL errors — do not leave any unfixed.
+    3. If a dependency is missing, add it to requirements.txt / package.json / go.mod.
+    4. If a test fails, fix the code (not the test) unless the test itself is wrong.
+    5. Return the COMPLETE updated file list as a raw JSON array.
+    6. Include ALL files (both fixed and unchanged), not just the ones you changed.
+    7. Return ONLY the JSON array — no markdown, no explanation.
 """)
 
 
@@ -104,6 +134,62 @@ def call_llm(messages: list[dict[str, str]]) -> str:
     except httpx.ConnectError:
         log.error("Cannot connect to LLM at %s. Is Ollama running?", OLLAMA_URL)
         raise SystemExit(1)
+
+
+def preflight_check() -> None:
+    """Verify that Ollama is reachable and the configured model is available.
+
+    Exits with a clear message if something is wrong so the user doesn't have
+    to debug cryptic HTTP errors mid-generation.
+    """
+    # 1. Check Ollama is reachable.
+    log.info("Preflight: checking Ollama at %s ...", OLLAMA_URL)
+    try:
+        resp = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=15)
+        resp.raise_for_status()
+    except httpx.ConnectError:
+        log.error(
+            "Cannot connect to Ollama at %s.\n"
+            "  Make sure the Ollama container is running:\n"
+            "    docker compose up -d ollama\n"
+            "  Then try again.",
+            OLLAMA_URL,
+        )
+        raise SystemExit(1)
+    except httpx.HTTPStatusError as exc:
+        log.error("Ollama returned HTTP %s: %s", exc.response.status_code, exc.response.text[:300])
+        raise SystemExit(1)
+
+    # 2. Check the model is pulled.
+    data = resp.json()
+    available_models: list[str] = []
+    for m in data.get("models", []):
+        name = m.get("name", "")
+        available_models.append(name)
+        # Ollama returns names like "llama3:latest"; match with or without tag.
+        if name == LLM_MODEL or name.startswith(f"{LLM_MODEL}:"):
+            log.info("Preflight: model '%s' is available.", LLM_MODEL)
+            return
+
+    if available_models:
+        models_str = ", ".join(available_models)
+        log.error(
+            "Model '%s' is not downloaded. Available models: %s\n"
+            "  Pull the model first:\n"
+            "    docker exec nexora-ollama ollama pull %s\n"
+            "  Then try again.",
+            LLM_MODEL,
+            models_str,
+            LLM_MODEL,
+        )
+    else:
+        log.error(
+            "No models found in Ollama. Pull a model first:\n"
+            "    docker exec nexora-ollama ollama pull %s\n"
+            "  Then try again.",
+            LLM_MODEL,
+        )
+    raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -241,8 +327,56 @@ def run_command(cmd: list[str], cwd: Path, timeout: int = 120) -> tuple[int, str
         return 1, f"Command not found: {cmd[0]}"
 
 
+def install_dependencies(project_dir: Path, language: str) -> tuple[bool, str]:
+    """Install project dependencies before building/testing. Return (success, output)."""
+    errors: list[str] = []
+
+    if language == "python":
+        req_file = project_dir / "requirements.txt"
+        if req_file.exists():
+            log.info("Installing Python dependencies...")
+            rc, out = run_command(
+                ["python3", "-m", "pip", "install", "-q", "-r", "requirements.txt"],
+                cwd=project_dir,
+            )
+            if rc != 0:
+                errors.append(f"pip install failed:\n{out}")
+        # Also create a venv-less setup for imports to work.
+        setup_py = project_dir / "setup.py"
+        pyproject = project_dir / "pyproject.toml"
+        if setup_py.exists() or pyproject.exists():
+            rc, out = run_command(
+                ["python3", "-m", "pip", "install", "-q", "-e", "."],
+                cwd=project_dir,
+            )
+            if rc != 0:
+                errors.append(f"pip install -e . failed:\n{out}")
+
+    elif language == "go":
+        go_mod = project_dir / "go.mod"
+        if not go_mod.exists():
+            log.info("Initializing Go module...")
+            run_command(["go", "mod", "init", "project"], cwd=project_dir)
+        log.info("Running go mod tidy...")
+        rc, out = run_command(["go", "mod", "tidy"], cwd=project_dir)
+        if rc != 0:
+            errors.append(f"go mod tidy failed:\n{out}")
+
+    elif language in ("javascript", "typescript"):
+        pkg_json = project_dir / "package.json"
+        if pkg_json.exists():
+            log.info("Installing Node.js dependencies...")
+            rc, out = run_command(["npm", "install"], cwd=project_dir)
+            if rc != 0:
+                errors.append(f"npm install failed:\n{out}")
+
+    if errors:
+        return False, "\n\n".join(errors)
+    return True, ""
+
+
 def build_and_test(project_dir: Path, language: str) -> tuple[bool, str]:
-    """Run build and test steps. Return (success, error_output)."""
+    """Run build, lint, and test steps. Return (success, error_output)."""
     commands = LANG_COMMANDS.get(language, LANG_COMMANDS["python"])
     errors: list[str] = []
 
@@ -254,6 +388,27 @@ def build_and_test(project_dir: Path, language: str) -> tuple[bool, str]:
             )
             if rc != 0:
                 errors.append(f"Compile error in {py_file.relative_to(project_dir)}:\n{out}")
+        # Lint with ruff (fast, catches common issues).
+        if not errors:
+            rc, out = run_command(
+                ["ruff", "check", "--select", "E,F,W", "--no-fix", "."],
+                cwd=project_dir,
+            )
+            if rc != 0:
+                errors.append(f"Lint errors (ruff):\n{out}")
+        # Auto-format with black (non-blocking — just apply).
+        run_command(["black", "--quiet", "."], cwd=project_dir)
+    elif language == "go":
+        build_cmd = commands.get("build")
+        if build_cmd:
+            rc, out = run_command(build_cmd, cwd=project_dir)
+            if rc != 0:
+                errors.append(f"Build failed:\n{out}")
+                return False, "\n\n".join(errors)
+        # go vet catches suspicious constructs.
+        rc, out = run_command(["go", "vet", "./..."], cwd=project_dir)
+        if rc != 0:
+            errors.append(f"Lint errors (go vet):\n{out}")
     else:
         build_cmd = commands.get("build")
         if build_cmd:
@@ -261,6 +416,15 @@ def build_and_test(project_dir: Path, language: str) -> tuple[bool, str]:
             if rc != 0:
                 errors.append(f"Build failed:\n{out}")
                 return False, "\n\n".join(errors)
+        # eslint for JS/TS (only if .eslintrc or eslint config exists, otherwise skip).
+        if language in ("javascript", "typescript"):
+            rc, out = run_command(
+                ["npx", "eslint", "--no-eslintrc", "--rule", "{no-undef: error, no-unused-vars: warn}", "."],
+                cwd=project_dir,
+            )
+            # eslint is advisory — don't block on it, just collect warnings.
+            if rc != 0 and "error" in out.lower():
+                errors.append(f"Lint errors (eslint):\n{out}")
 
     # Run tests.
     test_cmd = commands.get("test")
@@ -286,6 +450,32 @@ def generate_project_name(task: str) -> str:
     return f"{name}_{int(time.time()) % 100000}"
 
 
+def write_report(
+    project_dir: Path,
+    task: str,
+    language: str,
+    iterations: int,
+    success: bool,
+    final_errors: str,
+) -> None:
+    """Write a JSON report summarizing the generation result."""
+    files = [str(p.relative_to(project_dir)) for p in sorted(project_dir.rglob("*")) if p.is_file()]
+    report = {
+        "project": str(project_dir),
+        "task": task,
+        "language": language,
+        "iterations": iterations,
+        "success": success,
+        "files": files,
+        "file_count": len(files),
+        "errors": final_errors if not success else "",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    report_path = project_dir / "report.json"
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    log.info("Report written to %s", report_path)
+
+
 def run(
     task: str,
     language_hint: str | None = None,
@@ -301,6 +491,9 @@ def run(
 
     log.info("Project directory: %s", project_dir)
     log.info("Task: %s", task[:200])
+
+    # ── Preflight: verify Ollama + model before doing anything ──────────────
+    preflight_check()
 
     # ── Step 1: Initial generation ──────────────────────────────────────────
     messages: list[dict[str, str]] = [
@@ -320,19 +513,68 @@ def run(
     language = detect_language(files, language_hint)
     log.info("Detected language: %s", language)
 
-    # ── Step 2: Build / test / fix loop ─────────────────────────────────────
+    # ── Step 2: Install dependencies & build / test / fix loop ────────────
+    deps_installed = False
+    final_success = False
+    final_errors = ""
+    iterations_used = 0
     for iteration in range(1, max_iterations + 1):
+        iterations_used = iteration
         log.info("── Iteration %d / %d ──", iteration, max_iterations)
+
+        # Install dependencies once, and again after each fix (new deps may appear).
+        if not deps_installed or iteration > 1:
+            dep_ok, dep_err = install_dependencies(project_dir, language)
+            if not dep_ok:
+                log.warning("Dependency install issues:\n%s", dep_err)
+            deps_installed = True
 
         success, error_output = build_and_test(project_dir, language)
         if success:
             log.info("Build and tests passed!")
+            final_success = True
             break
+
+        final_errors = error_output
 
         log.warning("Errors found. Sending to LLM for correction...")
 
         current_files = read_project_files(project_dir)
-        files_json = json.dumps(current_files, indent=2, ensure_ascii=False)
+
+        # Smart context: extract filenames mentioned in errors and send only
+        # those files in full. Include a brief listing of other files so the
+        # LLM knows the project structure but doesn't blow the context window.
+        error_mentioned_files: set[str] = set()
+        for f in current_files:
+            if f["path"] in error_output:
+                error_mentioned_files.add(f["path"])
+
+        focused_files: list[dict[str, str]] = []
+        other_file_names: list[str] = []
+        for f in current_files:
+            if f["path"] in error_mentioned_files or f["path"].endswith(
+                ("requirements.txt", "package.json", "go.mod", "go.sum")
+            ):
+                focused_files.append(f)
+            else:
+                other_file_names.append(f["path"])
+
+        # If no specific files were identified, fall back to sending all files
+        # but truncate large ones to keep context manageable.
+        if not focused_files:
+            max_content_len = 3000
+            for f in current_files:
+                truncated = {
+                    "path": f["path"],
+                    "content": f["content"][:max_content_len]
+                    + ("\n... (truncated)" if len(f["content"]) > max_content_len else ""),
+                }
+                focused_files.append(truncated)
+            other_file_names = []
+
+        files_json = json.dumps(focused_files, indent=2, ensure_ascii=False)
+        if other_file_names:
+            files_json += f"\n\n(Other unchanged files: {', '.join(other_file_names)})"
 
         # Truncate error output to avoid exceeding context window.
         truncated_errors = error_output[:4000]
@@ -340,10 +582,11 @@ def run(
         fix_prompt = FIX_PROMPT_TEMPLATE.format(
             errors=truncated_errors, files_json=files_json
         )
+        # Don't include the previous raw_response — it's large and the files
+        # already contain the current state. Keep the conversation short.
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": task},
-            {"role": "assistant", "content": raw_response},
+            {"role": "user", "content": f"Original task: {task}"},
             {"role": "user", "content": fix_prompt},
         ]
         raw_response = call_llm(messages)
@@ -359,6 +602,9 @@ def run(
         log.warning(
             "Reached max iterations (%d). Project may still have errors.", max_iterations
         )
+
+    # ── Step 3: Write report ────────────────────────────────────────────────
+    write_report(project_dir, task, language, iterations_used, final_success, final_errors)
 
     log.info("Project saved to %s", project_dir)
     return project_dir

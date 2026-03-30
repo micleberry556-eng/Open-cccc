@@ -83,83 +83,28 @@ The BEAM VM was designed for exactly this kind of workload -- massive concurrenc
 +----------------------------------------------------+
 ```
 
-## Quick Start (Docker — recommended)
+## Quick Start
 
-The fastest way to run Nexora on any Linux server or PC. Docker and all
-dependencies are installed automatically.
+### Prerequisites
+- Erlang/OTP 25+
+- Elixir 1.14+
+- Node.js 18+ (for asset compilation)
 
-```bash
-git clone https://github.com/micleberry556-eng/Open-cccc.git
-cd Open-cccc
-
-# One-command install: installs Docker, generates secrets, builds & starts.
-chmod +x install.sh
-sudo ./install.sh
-```
-
-Open [http://localhost:4000](http://localhost:4000) to access the dashboard.
-
-After the first start, pull an LLM model for Ollama:
+### Setup
 
 ```bash
-docker exec nexora-ollama ollama pull llama3
-```
+# Clone the repository
+git clone https://github.com/yourusername/open_claw.git
+cd open_claw
 
-To stop / start later:
-
-```bash
-docker compose down          # stop
-docker compose up -d         # start again
-```
-
-### Generate a Project with the Agent
-
-Once Nexora is running and a model is pulled, use the sandbox to generate code:
-
-```bash
-# Generate a Python REST API from a task description
-docker exec nexora-sandbox agent_runner --task "Build a REST API for a todo app with FastAPI"
-
-# Generate from a task file
-echo "Build a CLI calculator in Go with unit tests" > workspace/task.md
-docker exec nexora-sandbox agent_runner --task-file /workspace/task.md --language go
-
-# Specify max fix iterations
-docker exec nexora-sandbox agent_runner --task "Snake game in Python with pygame" --max-iterations 10
-```
-
-Generated projects are saved to `./workspace/projects/`.
-
-### Publish to GitHub
-
-```bash
-# Push a generated project to a GitHub repository
-docker exec nexora-sandbox git_publish /workspace/projects/<project_name> https://github.com/user/repo.git
-
-# With a custom branch
-docker exec nexora-sandbox git_publish /workspace/projects/<project_name> https://github.com/user/repo.git dev
-```
-
-Set `GITHUB_TOKEN` in `.env` for automatic HTTPS authentication.
-
-### Manual Docker Setup
-
-If Docker is already installed:
-
-```bash
-cp .env.example .env
-# Edit .env — at minimum set SECRET_KEY_BASE:
-#   openssl rand -base64 64 | tr -d '\n'
-docker compose up -d --build
-```
-
-### Development Setup (without Docker)
-
-Prerequisites: Erlang/OTP 25+, Elixir 1.14+, Node.js 18+.
-
-```bash
+# Install dependencies
 mix setup
-export SECRET_KEY_BASE="$(openssl rand -base64 64 | tr -d '\n')"
+
+# Set your API keys (optional - works without them)
+export ANTHROPIC_API_KEY="sk-ant-..."
+export OPENAI_API_KEY="sk-..."
+
+# Start the server
 mix phx.server
 ```
 
@@ -167,77 +112,17 @@ Visit [`localhost:4000`](http://localhost:4000) to access the dashboard.
 
 ## Configuration
 
-All settings are managed through the `.env` file (see `.env.example` for the
-full list with descriptions). The `install.sh` script generates `.env`
-automatically on first run.
-
 ### Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `SECRET_KEY_BASE` | Phoenix secret for cookies/sessions | *generated* |
-| `PHX_HOST` | Hostname for generated URLs | `localhost` |
-| `NEXORA_PORT` | Port exposed on the host | `4000` |
-| `LOG_LEVEL` | Logging level (debug/info/warning/error) | `info` |
-| `MAX_AGENTS` | Max concurrent agent processes | `10` |
-| `HEARTBEAT_INTERVAL_SEC` | Agent heartbeat interval (seconds) | `30` |
-| `LLM_PROVIDER` | LLM backend: `local`, `ollama`, `openai` | `ollama` |
-| `LLM_API_KEY` | API key for cloud LLM providers | — |
-| `LLM_BASE_URL` | Custom LLM endpoint URL | *auto* |
-| `LLM_MODEL` | Model name (llama3, mistral, codellama, ...) | `llama3` |
-| `OLLAMA_PORT` | Ollama API port on the host | `11434` |
-| `WORKSPACE_DIR` | Host directory mounted at `/workspace` | `./workspace` |
-| `MAX_FIX_ITERATIONS` | Max generate-build-test-fix cycles | `5` |
-| `GITHUB_TOKEN` | GitHub token for auto-publishing | — |
-| `GIT_AUTHOR_NAME` | Git commit author name | `Nexora Agent` |
-| `GIT_AUTHOR_EMAIL` | Git commit author email | `agent@nexora.local` |
-| `BUDGET_LIMIT_USD` | Monthly budget cap (0 = unlimited) | `0` |
-| `AUTH_ENABLED` | Require login for web UI | `false` |
-| `ADMIN_USERNAME` | Admin login | `admin` |
-| `ADMIN_PASSWORD` | Admin password | — |
-| `ALLOWED_IPS` | Comma-separated IP allowlist | — |
-
-### Included Services
-
-| Service | Description |
-|---------|-------------|
-| **nexora** | Main application (Elixir/Phoenix) — dashboard, chat, terminal, agent management |
-| **sandbox** | Isolated build environment with Python 3, Node.js 20, Go 1.22, git, and build tools |
-| **ollama** | Local LLM server — runs models like Llama 3, Mistral, CodeLlama fully offline |
-
-### How the Agent Works
-
-```
-Task (ТЗ) ──> LLM generates code ──> Build ──> Test
-                                        |         |
-                                        |    Errors?
-                                        |     Yes ──> Send errors to LLM ──> Fix ──> Rebuild
-                                        |     No  ──> Done! Project in /workspace/projects/
-                                        |                    |
-                                        |              git_publish ──> GitHub / GitLab / etc.
-```
-
-1. You describe what you want (task / ТЗ) in natural language.
-2. The agent sends it to the local LLM (Ollama).
-3. LLM generates all source files (code, tests, Makefile, README).
-4. The sandbox builds and runs tests.
-5. If errors are found, they are sent back to the LLM for automatic correction.
-6. The cycle repeats until the build passes or max iterations are reached.
-7. The finished project can be published to GitHub with one command.
-
-### Workspace
-
-The `./workspace` directory on the host is mounted into both the Nexora and
-sandbox containers at `/workspace`. Generated projects go to
-`/workspace/projects/`. All changes are immediately visible on the host.
-
-### Supported Languages
-
-The sandbox supports building and testing projects in:
-- **Python** — pytest, black, ruff, mypy
-- **JavaScript** — npm, jest, eslint, prettier
-- **TypeScript** — tsc, ts-node, jest, eslint
-- **Go** — go build, go test, goimports
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `ANTHROPIC_API_KEY` | Anthropic Claude API key | No |
+| `OPENAI_API_KEY` | OpenAI API key | No |
+| `GOOGLE_API_KEY` | Google Gemini API key | No |
+| `OLLAMA_URL` | Ollama server URL (default: localhost:11434) | No |
+| `SECRET_KEY_BASE` | Phoenix secret (required in prod) | Prod only |
+| `PHX_HOST` | Production hostname | Prod only |
+| `PORT` | HTTP port (default: 4000) | No |
 
 ## Tech Stack
 
