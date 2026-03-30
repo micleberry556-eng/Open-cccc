@@ -221,8 +221,34 @@ defmodule Nexora.Org.OrgChart do
       %{id: "researcher", title: "Research Analyst", department: "Research", description: "Conducts market research and analysis", reports_to: "ceo", permissions: [:read, :execute]}
     ]
 
-    for r <- roles do
-      add_role(r)
+    # Insert directly into ETS instead of calling add_role/1 (which would
+    # deadlock because we are inside init/1 and the GenServer is not yet
+    # ready to handle calls).
+    for attrs <- roles do
+      role = %Role{
+        id: attrs[:id],
+        title: attrs[:title] || "New Role",
+        department: attrs[:department] || "General",
+        agent_id: nil,
+        reports_to: attrs[:reports_to],
+        description: attrs[:description] || "",
+        permissions: attrs[:permissions] || [:read, :execute],
+        created_at: DateTime.utc_now()
+      }
+
+      :ets.insert(@table, {role.id, role})
+    end
+
+    # Wire up direct_reports after all roles are inserted.
+    for [{_, role}] <- Enum.map(:ets.tab2list(@table), &[&1]) do
+      if role.reports_to do
+        case :ets.lookup(@table, role.reports_to) do
+          [{_, parent}] ->
+            updated = %{parent | direct_reports: [role.id | parent.direct_reports] |> Enum.uniq()}
+            :ets.insert(@table, {parent.id, updated})
+          _ -> :ok
+        end
+      end
     end
   end
 
