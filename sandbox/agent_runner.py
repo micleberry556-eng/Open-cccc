@@ -31,6 +31,9 @@ from typing import Any
 
 import httpx
 
+# Import the multi-provider LLM abstraction (lives next to this file).
+from llm_providers import LLMConfig, chat, preflight_check, resolve_config
+
 # ---------------------------------------------------------------------------
 # Configuration (overridable via environment variables)
 # ---------------------------------------------------------------------------
@@ -41,6 +44,22 @@ MAX_ITERATIONS = int(os.getenv("MAX_FIX_ITERATIONS", "5"))
 PROJECTS_DIR = Path(os.getenv("PROJECTS_DIR", "/workspace/projects"))
 REQUEST_TIMEOUT = int(os.getenv("LLM_TIMEOUT_SEC", "300"))
 LOG_DIR = Path(os.getenv("LOG_DIR", "/workspace/logs"))
+
+# Resolve LLM provider configuration from environment variables.
+_llm_config: LLMConfig | None = None
+
+
+def get_llm_config() -> LLMConfig:
+    """Lazy-init the LLM config so env vars are read at call time."""
+    global _llm_config  # noqa: PLW0603
+    if _llm_config is None:
+        _llm_config = resolve_config()
+    return _llm_config
+
+
+def call_llm(messages: list[dict[str, str]]) -> str:
+    """Send a chat request through the configured provider."""
+    return chat(get_llm_config(), messages)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,7 +75,7 @@ _file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(mess
 log.addHandler(_file_handler)
 
 # ---------------------------------------------------------------------------
-# LLM interaction
+# LLM interaction (prompts — the actual call_llm is defined above)
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = textwrap.dedent("""\
@@ -198,85 +217,6 @@ SINGLE_FILE_FIX_PROMPT = textwrap.dedent("""\
     Fix ALL errors in this file. Return ONLY the corrected file content.
     No markdown fences, no explanation — just the raw fixed code.
 """)
-
-
-def call_llm(messages: list[dict[str, str]]) -> str:
-    """Send a chat completion request to Ollama and return the response text."""
-    url = f"{OLLAMA_URL}/api/chat"
-    payload = {
-        "model": LLM_MODEL,
-        "messages": messages,
-        "stream": False,
-        "options": {"temperature": 0.2, "num_predict": 16384},
-    }
-    log.info("Calling LLM (%s) ...", LLM_MODEL)
-    try:
-        resp = httpx.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("message", {}).get("content", "")
-    except httpx.HTTPStatusError as exc:
-        log.error("LLM HTTP error %s: %s", exc.response.status_code, exc.response.text[:500])
-        raise
-    except httpx.ConnectError:
-        log.error("Cannot connect to LLM at %s. Is Ollama running?", OLLAMA_URL)
-        raise SystemExit(1)
-
-
-def preflight_check() -> None:
-    """Verify that Ollama is reachable and the configured model is available.
-
-    Exits with a clear message if something is wrong so the user doesn't have
-    to debug cryptic HTTP errors mid-generation.
-    """
-    # 1. Check Ollama is reachable.
-    log.info("Preflight: checking Ollama at %s ...", OLLAMA_URL)
-    try:
-        resp = httpx.get(f"{OLLAMA_URL}/api/tags", timeout=15)
-        resp.raise_for_status()
-    except httpx.ConnectError:
-        log.error(
-            "Cannot connect to Ollama at %s.\n"
-            "  Make sure the Ollama container is running:\n"
-            "    docker compose up -d ollama\n"
-            "  Then try again.",
-            OLLAMA_URL,
-        )
-        raise SystemExit(1)
-    except httpx.HTTPStatusError as exc:
-        log.error("Ollama returned HTTP %s: %s", exc.response.status_code, exc.response.text[:300])
-        raise SystemExit(1)
-
-    # 2. Check the model is pulled.
-    data = resp.json()
-    available_models: list[str] = []
-    for m in data.get("models", []):
-        name = m.get("name", "")
-        available_models.append(name)
-        # Ollama returns names like "llama3:latest"; match with or without tag.
-        if name == LLM_MODEL or name.startswith(f"{LLM_MODEL}:"):
-            log.info("Preflight: model '%s' is available.", LLM_MODEL)
-            return
-
-    if available_models:
-        models_str = ", ".join(available_models)
-        log.error(
-            "Model '%s' is not downloaded. Available models: %s\n"
-            "  Pull the model first:\n"
-            "    docker exec nexora-ollama ollama pull %s\n"
-            "  Then try again.",
-            LLM_MODEL,
-            models_str,
-            LLM_MODEL,
-        )
-    else:
-        log.error(
-            "No models found in Ollama. Pull a model first:\n"
-            "    docker exec nexora-ollama ollama pull %s\n"
-            "  Then try again.",
-            LLM_MODEL,
-        )
-    raise SystemExit(1)
 
 
 # ---------------------------------------------------------------------------
@@ -811,7 +751,7 @@ def run(
     log.info("Task: %s", task[:200])
 
     # ── Preflight: verify Ollama + model before doing anything ──────────────
-    preflight_check()
+    preflight_check(get_llm_config())
 
     # ── Step 1: Try plan-based generation (Phase 1 + Phase 2) ──────────────
     plan = generate_plan(task)
@@ -1001,9 +941,17 @@ def main() -> None:
         "--project-name", "-n", type=str, default=None, help="Custom project directory name."
     )
     parser.add_argument(
+        "--provider", "-p", type=str, default=None,
+        help="LLM provider: ollama, deepseek, openai, anthropic, gemini, openrouter."
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="Only generate the plan, don't write code."
     )
     args = parser.parse_args()
+
+    # Override provider via CLI flag (takes precedence over .env).
+    if args.provider:
+        os.environ["LLM_PROVIDER"] = args.provider
 
     if args.task_file:
         task = Path(args.task_file).read_text(encoding="utf-8").strip()
@@ -1014,7 +962,7 @@ def main() -> None:
         return  # unreachable, keeps type checker happy
 
     if args.dry_run:
-        preflight_check()
+        preflight_check(get_llm_config())
         plan = generate_plan(task)
         if plan:
             print(json.dumps(plan, indent=2, ensure_ascii=False))

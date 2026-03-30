@@ -62,9 +62,14 @@ RUN mkdir -p /workspace /projects
 WORKDIR /workspace
 
 # ── Agent scripts (copied from the sandbox/ directory) ──────────────────────
+COPY sandbox/llm_providers.py /usr/local/bin/llm_providers.py
 COPY sandbox/agent_runner.py /usr/local/bin/agent_runner
 COPY sandbox/git_publish.sh  /usr/local/bin/git_publish
-RUN chmod +x /usr/local/bin/agent_runner /usr/local/bin/git_publish
+COPY sandbox/project_run.sh  /usr/local/bin/project_run
+RUN chmod +x /usr/local/bin/agent_runner /usr/local/bin/git_publish /usr/local/bin/project_run
+
+# Expose port for running generated projects (e.g., web apps).
+EXPOSE 8080
 
 # Keep the container running so Nexora can exec into it.
 CMD ["tail", "-f", "/dev/null"]
