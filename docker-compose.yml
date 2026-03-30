@@ -3,6 +3,7 @@
 # Stop with:   docker compose down
 
 services:
+  # ---------- Nexora application ----------
   nexora:
     build:
       context: .
@@ -14,14 +15,44 @@ services:
     env_file:
       - .env
     environment:
-      # Required by Phoenix in production mode.
       PHX_SERVER: "true"
       PHX_HOST: "${PHX_HOST:-localhost}"
       PORT: "4000"
       SECRET_KEY_BASE: "${SECRET_KEY_BASE}"
+      # Point the LLM client at the Ollama container.
+      LLM_BASE_URL: "http://ollama:11434"
+    volumes:
+      # Host workspace mounted into the container so agents can
+      # read/write files on the host machine.
+      - ${WORKSPACE_DIR:-./workspace}:/workspace
+    depends_on:
+      ollama:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4000/"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  # ---------- Ollama — local LLM server ----------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: nexora-ollama
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      # Persist downloaded models between restarts.
+      - ollama_data:/root/.ollama
+    # Uncomment the following lines to enable GPU passthrough (NVIDIA).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  ollama_data:

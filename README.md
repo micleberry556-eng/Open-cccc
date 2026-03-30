@@ -99,6 +99,12 @@ sudo ./install.sh
 
 Open [http://localhost:4000](http://localhost:4000) to access the dashboard.
 
+After the first start, pull an LLM model for Ollama:
+
+```bash
+docker exec nexora-ollama ollama pull llama3
+```
+
 To stop / start later:
 
 ```bash
@@ -154,6 +160,27 @@ automatically on first run.
 | `ADMIN_USERNAME` | Admin login | `admin` |
 | `ADMIN_PASSWORD` | Admin password | — |
 | `ALLOWED_IPS` | Comma-separated IP allowlist | — |
+| `OLLAMA_PORT` | Ollama API port on the host | `11434` |
+| `WORKSPACE_DIR` | Host directory mounted at `/workspace` | `./workspace` |
+
+### Included Services
+
+| Service | Description |
+|---------|-------------|
+| **nexora** | Main application (Elixir/Phoenix) with Python 3, pip, and common libraries pre-installed |
+| **ollama** | Local LLM server — runs models like Llama 3, Mistral, CodeLlama fully offline |
+
+### Agent Workspace
+
+The `./workspace` directory on the host is mounted into the container at
+`/workspace`. Agents can read and write files there, and any changes are
+immediately visible on the host. Change the path via `WORKSPACE_DIR` in `.env`.
+
+### Python Environment
+
+The Nexora container includes Python 3 with these libraries pre-installed:
+`requests`, `httpx`, `beautifulsoup4`, `pandas`, `numpy`, `pyyaml`, `jinja2`.
+Agents can install additional packages with `pip3 install`.
 
 ## Tech Stack
 

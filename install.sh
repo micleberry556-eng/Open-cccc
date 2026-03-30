@@ -143,6 +143,21 @@ install_curl() {
 # Generate .env file
 # ---------------------------------------------------------------------------
 
+create_workspace() {
+  local workspace_dir
+  workspace_dir="$(cd "$(dirname "$0")" && pwd)/workspace"
+
+  if [[ -d "$workspace_dir" ]]; then
+    info "Workspace directory already exists: ${workspace_dir}"
+    return
+  fi
+
+  info "Creating workspace directory for agent file access..."
+  mkdir -p "$workspace_dir"
+  chmod 777 "$workspace_dir"
+  info "Workspace created at ${workspace_dir}"
+}
+
 generate_env() {
   local env_file
   env_file="$(cd "$(dirname "$0")" && pwd)/.env"
@@ -222,6 +237,7 @@ main() {
   install_curl
   install_docker
   install_compose
+  create_workspace
   generate_env
   start_app
 
