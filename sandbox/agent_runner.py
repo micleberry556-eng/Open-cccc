@@ -24,7 +24,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import textwrap
 import time
 from pathlib import Path
@@ -41,6 +40,7 @@ LLM_MODEL = os.getenv("LLM_MODEL", "llama3")
 MAX_ITERATIONS = int(os.getenv("MAX_FIX_ITERATIONS", "5"))
 PROJECTS_DIR = Path(os.getenv("PROJECTS_DIR", "/workspace/projects"))
 REQUEST_TIMEOUT = int(os.getenv("LLM_TIMEOUT_SEC", "300"))
+LOG_DIR = Path(os.getenv("LOG_DIR", "/workspace/logs"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,6 +48,12 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("agent_runner")
+
+# Add file handler so logs survive container restarts.
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+_file_handler = logging.FileHandler(LOG_DIR / "agent_runner.log", encoding="utf-8")
+_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+log.addHandler(_file_handler)
 
 # ---------------------------------------------------------------------------
 # LLM interaction
@@ -315,10 +321,17 @@ def parse_files(raw: str) -> list[dict[str, str]]:
 
 
 def write_project(project_dir: Path, files: list[dict[str, str]]) -> None:
-    """Write generated files to disk."""
+    """Write generated files to disk, backing up any file that will be overwritten."""
+    backup_dir = project_dir / ".backups"
     for f in files:
         fpath = project_dir / f["path"]
         fpath.parent.mkdir(parents=True, exist_ok=True)
+        # Back up existing file before overwriting so we can recover if the
+        # LLM-provided replacement is worse.
+        if fpath.exists():
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = backup_dir / f["path"].replace("/", "__")
+            shutil.copy2(fpath, backup_path)
         fpath.write_text(f["content"], encoding="utf-8")
         log.info("  wrote %s", f["path"])
 
@@ -610,18 +623,31 @@ def generate_file_by_plan(
     language: str,
 ) -> str:
     """Phase 2: Generate a single file based on the plan and existing files."""
-    # Build a summary of already-written files (names + first few lines).
-    existing: list[str] = []
+    current_path = file_entry.get("path", "")
+
+    # Build context: include dependency files in full and other source files
+    # as short previews (name + first lines) to keep context manageable.
+    full_files: list[str] = []
+    preview_files: list[str] = []
+    dep_names = {"requirements.txt", "package.json", "go.mod", "go.sum", "tsconfig.json"}
+
     for fpath in sorted(project_dir.rglob("*")):
         if fpath.is_file() and not fpath.name.startswith("."):
             rel = str(fpath.relative_to(project_dir))
+            if rel == current_path:
+                continue  # Don't include the file we're about to generate.
             try:
-                preview = fpath.read_text(encoding="utf-8", errors="replace")[:500]
+                content = fpath.read_text(encoding="utf-8", errors="replace")
             except Exception:
-                preview = "(unreadable)"
-            existing.append(f"--- {rel} ---\n{preview}\n")
+                continue
+            if fpath.name in dep_names or len(content) < 800:
+                # Small files and dependency files — include in full.
+                full_files.append(f"--- {rel} ---\n{content}\n")
+            else:
+                # Larger source files — include a preview.
+                preview_files.append(f"--- {rel} (first 40 lines) ---\n{''.join(content.splitlines(True)[:40])}\n")
 
-    existing_str = "\n".join(existing) if existing else "(none yet)"
+    existing_str = "\n".join(full_files + preview_files) if (full_files or preview_files) else "(none yet)"
     plan_summary = json.dumps(
         {
             "project_name": plan.get("project_name", ""),
@@ -717,6 +743,57 @@ def fix_single_file(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+_GITIGNORE_TEMPLATES: dict[str, str] = {
+    "python": textwrap.dedent("""\
+        __pycache__/
+        *.pyc
+        *.pyo
+        .venv/
+        venv/
+        *.egg-info/
+        dist/
+        build/
+        .mypy_cache/
+        .ruff_cache/
+        .pytest_cache/
+        htmlcov/
+        .coverage
+    """),
+    "javascript": textwrap.dedent("""\
+        node_modules/
+        npm-debug.log
+        dist/
+        .cache/
+        coverage/
+    """),
+    "typescript": textwrap.dedent("""\
+        node_modules/
+        npm-debug.log
+        dist/
+        .cache/
+        coverage/
+        *.js.map
+    """),
+    "go": textwrap.dedent("""\
+        /vendor/
+        *.exe
+        *.test
+        *.out
+    """),
+}
+
+
+def _generate_gitignore(language: str) -> str:
+    """Return a .gitignore appropriate for the given language."""
+    common = "# IDE\n.idea/\n.vscode/\n*.swp\n*.swo\n\n# OS\n.DS_Store\nThumbs.db\n"
+    lang_specific = _GITIGNORE_TEMPLATES.get(language, "")
+    return f"# Auto-generated by Nexora Agent\n\n{lang_specific}\n{common}"
+
+
 def run(
     task: str,
     language_hint: str | None = None,
@@ -749,6 +826,12 @@ def run(
             req_path = project_dir / "requirements.txt"
             req_path.write_text("\n".join(deps) + "\n", encoding="utf-8")
             log.info("  wrote requirements.txt (%d deps)", len(deps))
+
+        # Generate a language-appropriate .gitignore so the project is
+        # ready for version control from the start.
+        gitignore_content = _generate_gitignore(language)
+        (project_dir / ".gitignore").write_text(gitignore_content, encoding="utf-8")
+        log.info("  wrote .gitignore")
 
         # Generate each file individually, validate after each one.
         for file_entry in plan["files"]:
@@ -917,6 +1000,9 @@ def main() -> None:
     parser.add_argument(
         "--project-name", "-n", type=str, default=None, help="Custom project directory name."
     )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Only generate the plan, don't write code."
+    )
     args = parser.parse_args()
 
     if args.task_file:
@@ -926,6 +1012,15 @@ def main() -> None:
     else:
         parser.error("Provide --task or --task-file.")
         return  # unreachable, keeps type checker happy
+
+    if args.dry_run:
+        preflight_check()
+        plan = generate_plan(task)
+        if plan:
+            print(json.dumps(plan, indent=2, ensure_ascii=False))
+        else:
+            print("Plan generation failed.")
+        return
 
     project_dir = run(
         task=task,
