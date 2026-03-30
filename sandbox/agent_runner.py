@@ -112,6 +112,87 @@ FIX_PROMPT_TEMPLATE = textwrap.dedent("""\
     7. Return ONLY the JSON array — no markdown, no explanation.
 """)
 
+# ── Phase-based generation prompts ──────────────────────────────────────────
+
+PLAN_PROMPT = textwrap.dedent("""\
+    You are an expert software architect. The user will give you a task
+    description. Create a detailed project plan.
+
+    Return ONLY a raw JSON object (no markdown, no explanation). The object must
+    have these keys:
+
+    {
+      "project_name": "short_name",
+      "language": "python",
+      "description": "One-line summary",
+      "dependencies": ["fastapi>=0.100.0", "pytest>=7.0.0"],
+      "files": [
+        {
+          "path": "main.py",
+          "purpose": "Entry point — FastAPI app with routes"
+        },
+        {
+          "path": "models.py",
+          "purpose": "Pydantic models for request/response"
+        },
+        {
+          "path": "test_main.py",
+          "purpose": "Tests for all API endpoints"
+        },
+        {
+          "path": "README.md",
+          "purpose": "Install, run, and test instructions"
+        }
+      ]
+    }
+
+    RULES:
+    - Always include a dependency file (requirements.txt / package.json / go.mod).
+    - Always include test files.
+    - Always include README.md.
+    - Keep file count reasonable (3-10 files for most projects).
+    - Each file must have a clear, specific purpose.
+    - Use the most appropriate language for the task unless specified.
+""")
+
+FILE_GEN_PROMPT_TEMPLATE = textwrap.dedent("""\
+    You are implementing file "{file_path}" for the following project.
+
+    PROJECT PLAN:
+    {plan_summary}
+
+    FILES ALREADY WRITTEN:
+    {existing_files}
+
+    PURPOSE OF THIS FILE:
+    {file_purpose}
+
+    INSTRUCTIONS:
+    - Write the COMPLETE content of this file. No placeholders, no stubs.
+    - Make sure imports reference the other files in the project correctly.
+    - Follow best practices for {language}.
+    - Return ONLY the raw file content. No markdown fences, no explanation,
+      no JSON wrapping. Just the code/text that goes into the file.
+""")
+
+SINGLE_FILE_FIX_PROMPT = textwrap.dedent("""\
+    The file "{file_path}" has errors:
+
+    ```
+    {errors}
+    ```
+
+    Current content of the file:
+    ```
+    {file_content}
+    ```
+
+    Other project files for context: {other_files_list}
+
+    Fix ALL errors in this file. Return ONLY the corrected file content.
+    No markdown fences, no explanation — just the raw fixed code.
+""")
+
 
 def call_llm(messages: list[dict[str, str]]) -> str:
     """Send a chat completion request to Ollama and return the response text."""
@@ -476,6 +557,166 @@ def write_report(
     log.info("Report written to %s", report_path)
 
 
+# ---------------------------------------------------------------------------
+# Plan-based generation (Phase 1 + Phase 2)
+# ---------------------------------------------------------------------------
+
+
+def parse_plan(raw: str) -> dict[str, Any]:
+    """Parse the LLM plan response into a structured dict."""
+    cleaned = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip(), flags=re.MULTILINE)
+    cleaned = re.sub(r"\n?```\s*$", "", cleaned.strip(), flags=re.MULTILINE)
+    try:
+        plan = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            plan = json.loads(match.group())
+        else:
+            log.error("Could not parse plan as JSON:\n%s", raw[:1000])
+            return {}
+    if not isinstance(plan, dict):
+        return {}
+    return plan
+
+
+def generate_plan(task: str) -> dict[str, Any]:
+    """Phase 1: Ask LLM to create a project architecture plan."""
+    log.info("Phase 1: Generating project plan...")
+    messages = [
+        {"role": "system", "content": PLAN_PROMPT},
+        {"role": "user", "content": task},
+    ]
+    raw = call_llm(messages)
+    plan = parse_plan(raw)
+    if not plan or "files" not in plan:
+        log.warning("Plan generation failed, falling back to single-shot mode.")
+        return {}
+    log.info(
+        "Plan: %s (%s) — %d files",
+        plan.get("project_name", "?"),
+        plan.get("language", "?"),
+        len(plan.get("files", [])),
+    )
+    for f in plan.get("files", []):
+        log.info("  - %s: %s", f.get("path", "?"), f.get("purpose", ""))
+    return plan
+
+
+def generate_file_by_plan(
+    plan: dict[str, Any],
+    file_entry: dict[str, str],
+    project_dir: Path,
+    language: str,
+) -> str:
+    """Phase 2: Generate a single file based on the plan and existing files."""
+    # Build a summary of already-written files (names + first few lines).
+    existing: list[str] = []
+    for fpath in sorted(project_dir.rglob("*")):
+        if fpath.is_file() and not fpath.name.startswith("."):
+            rel = str(fpath.relative_to(project_dir))
+            try:
+                preview = fpath.read_text(encoding="utf-8", errors="replace")[:500]
+            except Exception:
+                preview = "(unreadable)"
+            existing.append(f"--- {rel} ---\n{preview}\n")
+
+    existing_str = "\n".join(existing) if existing else "(none yet)"
+    plan_summary = json.dumps(
+        {
+            "project_name": plan.get("project_name", ""),
+            "description": plan.get("description", ""),
+            "language": plan.get("language", language),
+            "dependencies": plan.get("dependencies", []),
+            "files": [f.get("path", "") for f in plan.get("files", [])],
+        },
+        indent=2,
+    )
+
+    prompt = FILE_GEN_PROMPT_TEMPLATE.format(
+        file_path=file_entry.get("path", ""),
+        plan_summary=plan_summary,
+        existing_files=existing_str,
+        file_purpose=file_entry.get("purpose", ""),
+        language=language,
+    )
+    messages = [
+        {"role": "system", "content": "You are an expert software engineer. Write clean, working code."},
+        {"role": "user", "content": prompt},
+    ]
+    raw = call_llm(messages)
+    # Strip markdown fences if the LLM wraps the response.
+    content = re.sub(r"^```\w*\s*\n?", "", raw.strip(), flags=re.MULTILINE)
+    content = re.sub(r"\n?```\s*$", "", content.strip(), flags=re.MULTILINE)
+    return content
+
+
+def validate_single_file(file_path: Path, language: str) -> tuple[bool, str]:
+    """Quick syntax check for a single file. Return (ok, error_msg)."""
+    if language == "python" and file_path.suffix == ".py":
+        rc, out = run_command(
+            ["python3", "-m", "py_compile", str(file_path)],
+            cwd=file_path.parent,
+        )
+        if rc != 0:
+            return False, out
+    elif language == "go" and file_path.suffix == ".go":
+        # go vet on a single file isn't practical; skip per-file for Go.
+        pass
+    elif language in ("javascript", "typescript") and file_path.suffix in (".js", ".ts"):
+        if file_path.suffix == ".ts":
+            rc, out = run_command(
+                ["npx", "tsc", "--noEmit", "--allowJs", str(file_path)],
+                cwd=file_path.parent,
+            )
+            if rc != 0:
+                return False, out
+    return True, ""
+
+
+def fix_single_file(
+    file_path: Path,
+    error_msg: str,
+    project_dir: Path,
+    language: str,
+    max_retries: int = 3,
+) -> bool:
+    """Try to fix a single file up to max_retries times. Return True if fixed."""
+    rel = str(file_path.relative_to(project_dir))
+    other_files = [
+        str(p.relative_to(project_dir))
+        for p in sorted(project_dir.rglob("*"))
+        if p.is_file() and p != file_path and not p.name.startswith(".")
+    ]
+
+    for attempt in range(1, max_retries + 1):
+        log.info("  Fixing %s (attempt %d/%d)...", rel, attempt, max_retries)
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        prompt = SINGLE_FILE_FIX_PROMPT.format(
+            file_path=rel,
+            errors=error_msg[:2000],
+            file_content=content[:4000],
+            other_files_list=", ".join(other_files),
+        )
+        messages = [
+            {"role": "system", "content": "You are an expert software engineer. Fix the code."},
+            {"role": "user", "content": prompt},
+        ]
+        raw = call_llm(messages)
+        fixed = re.sub(r"^```\w*\s*\n?", "", raw.strip(), flags=re.MULTILINE)
+        fixed = re.sub(r"\n?```\s*$", "", fixed.strip(), flags=re.MULTILINE)
+        file_path.write_text(fixed, encoding="utf-8")
+
+        ok, new_err = validate_single_file(file_path, language)
+        if ok:
+            log.info("  Fixed %s successfully.", rel)
+            return True
+        error_msg = new_err
+
+    log.warning("  Could not fix %s after %d attempts.", rel, max_retries)
+    return False
+
+
 def run(
     task: str,
     language_hint: str | None = None,
@@ -495,22 +736,64 @@ def run(
     # ── Preflight: verify Ollama + model before doing anything ──────────────
     preflight_check()
 
-    # ── Step 1: Initial generation ──────────────────────────────────────────
-    messages: list[dict[str, str]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": task},
-    ]
-    raw_response = call_llm(messages)
-    files = parse_files(raw_response)
+    # ── Step 1: Try plan-based generation (Phase 1 + Phase 2) ──────────────
+    plan = generate_plan(task)
+    language = language_hint or plan.get("language", "python")
 
-    if not files:
-        log.error("LLM returned no parseable files. Aborting.")
-        raise SystemExit(1)
+    if plan and plan.get("files"):
+        log.info("Using plan-based generation (file-by-file)...")
 
-    log.info("Generated %d files.", len(files))
-    write_project(project_dir, files)
+        # Write dependency file first if specified in the plan.
+        deps = plan.get("dependencies", [])
+        if deps and language == "python":
+            req_path = project_dir / "requirements.txt"
+            req_path.write_text("\n".join(deps) + "\n", encoding="utf-8")
+            log.info("  wrote requirements.txt (%d deps)", len(deps))
 
-    language = detect_language(files, language_hint)
+        # Generate each file individually, validate after each one.
+        for file_entry in plan["files"]:
+            fpath_str = file_entry.get("path", "")
+            if not fpath_str:
+                continue
+            # Skip dependency files we already wrote.
+            if fpath_str == "requirements.txt" and (project_dir / fpath_str).exists():
+                continue
+
+            log.info("Phase 2: Generating %s ...", fpath_str)
+            content = generate_file_by_plan(plan, file_entry, project_dir, language)
+
+            fpath = project_dir / fpath_str
+            fpath.parent.mkdir(parents=True, exist_ok=True)
+            fpath.write_text(content, encoding="utf-8")
+            log.info("  wrote %s", fpath_str)
+
+            # Validate immediately after writing.
+            ok, err = validate_single_file(fpath, language)
+            if not ok:
+                log.warning("  Syntax error in %s, attempting fix...", fpath_str)
+                fix_single_file(fpath, err, project_dir, language)
+
+        # Detect language from actual files if hint wasn't given.
+        actual_files = read_project_files(project_dir)
+        if not language_hint:
+            language = detect_language(actual_files, language_hint)
+    else:
+        # Fallback: single-shot generation (original behavior).
+        log.info("Using single-shot generation...")
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": task},
+        ]
+        raw_response = call_llm(messages)
+        files = parse_files(raw_response)
+
+        if not files:
+            log.error("LLM returned no parseable files. Aborting.")
+            raise SystemExit(1)
+
+        log.info("Generated %d files.", len(files))
+        write_project(project_dir, files)
+        language = detect_language(files, language_hint)
     log.info("Detected language: %s", language)
 
     # ── Step 2: Install dependencies & build / test / fix loop ────────────
