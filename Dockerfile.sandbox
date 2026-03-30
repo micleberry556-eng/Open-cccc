@@ -1,0 +1,70 @@
+# Nexora Sandbox — isolated build/test/run environment for AI agents.
+#
+# This container provides Python, Node.js, Go, git, and common build tools.
+# Agents generate code, build, test, and fix it inside this sandbox.
+# The /workspace volume is shared with the host and the main Nexora container.
+
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── Core system packages ────────────────────────────────────────────────────
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    # Essentials
+    ca-certificates curl wget gnupg lsb-release \
+    # Build tools
+    build-essential cmake pkg-config \
+    # Version control
+    git openssh-client \
+    # Utilities
+    jq tree zip unzip file less nano \
+    # Networking
+    iproute2 dnsutils \
+    # Locale
+    locales \
+  && sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen \
+  && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV LANG=en_US.UTF-8 \
+    LANGUAGE=en_US:en \
+    LC_ALL=en_US.UTF-8
+
+# ── Python 3 ────────────────────────────────────────────────────────────────
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv python3-dev \
+  && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir --break-system-packages \
+    requests httpx beautifulsoup4 \
+    pandas numpy scipy \
+    pyyaml jinja2 toml \
+    pytest pytest-cov black ruff mypy \
+    flask fastapi uvicorn \
+    sqlalchemy pydantic \
+    click rich
+
+# ── Node.js 20 LTS ─────────────────────────────────────────────────────────
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+  && apt-get install -y --no-install-recommends nodejs \
+  && apt-get clean && rm -rf /var/lib/apt/lists/* \
+  && npm install -g npm@latest typescript ts-node eslint prettier jest
+
+# ── Go 1.22 ─────────────────────────────────────────────────────────────────
+RUN ARCH="$(dpkg --print-architecture)" \
+  && curl -fsSL "https://go.dev/dl/go1.22.5.linux-${ARCH}.tar.gz" \
+     | tar -C /usr/local -xz
+ENV PATH="/usr/local/go/bin:/root/go/bin:${PATH}"
+RUN go install golang.org/x/tools/cmd/goimports@latest \
+  && go install golang.org/x/lint/golint@latest 2>/dev/null || true
+
+# ── Workspace ───────────────────────────────────────────────────────────────
+RUN mkdir -p /workspace /projects
+WORKDIR /workspace
+
+# ── Agent scripts (copied from the sandbox/ directory) ──────────────────────
+COPY sandbox/agent_runner.py /usr/local/bin/agent_runner
+COPY sandbox/git_publish.sh  /usr/local/bin/git_publish
+RUN chmod +x /usr/local/bin/agent_runner /usr/local/bin/git_publish
+
+# Keep the container running so Nexora can exec into it.
+CMD ["tail", "-f", "/dev/null"]

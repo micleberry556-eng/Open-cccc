@@ -71,12 +71,10 @@ RUN apt-get update -y && \
   apt-get install -y \
     libstdc++6 openssl libncurses5 locales ca-certificates \
     curl tini \
-    # Python runtime so agents can write and execute Python scripts.
     python3 python3-pip python3-venv \
   && apt-get clean && rm -f /var/lib/apt/lists/*_*
 
-# Install commonly-used Python libraries system-wide so they are available
-# out of the box when agents run Python code.
+# Install commonly-used Python libraries for agent scripts.
 RUN pip3 install --no-cache-dir --break-system-packages \
     requests httpx beautifulsoup4 pandas numpy pyyaml jinja2
 
@@ -89,8 +87,7 @@ ENV LC_ALL en_US.UTF-8
 
 WORKDIR "/app"
 
-# Create a workspace directory where agents store files.
-# This directory is expected to be bind-mounted from the host via docker-compose.
+# Create workspace directory (bind-mounted from host via docker-compose).
 RUN mkdir -p /workspace && chown nobody:nogroup /workspace
 
 RUN chown nobody /app

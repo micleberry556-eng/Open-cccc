@@ -154,7 +154,9 @@ create_workspace() {
 
   info "Creating workspace directory for agent file access..."
   mkdir -p "$workspace_dir"
+  mkdir -p "$workspace_dir/projects"
   chmod 777 "$workspace_dir"
+  chmod 777 "$workspace_dir/projects"
   info "Workspace created at ${workspace_dir}"
 }
 
@@ -212,6 +214,11 @@ start_app() {
       info "  Nexora is running!"
       info "  Open http://localhost:${NEXORA_PORT:-4000}"
       info "============================================"
+      echo ""
+      info "Next steps:"
+      info "  1. Pull an LLM model:  docker exec nexora-ollama ollama pull llama3"
+      info "  2. Generate a project: docker exec nexora-sandbox agent_runner --task 'Your task here'"
+      info "  3. Publish to GitHub:  docker exec nexora-sandbox git_publish /workspace/projects/<name> <repo_url>"
       return
     fi
     retries=$((retries - 1))
