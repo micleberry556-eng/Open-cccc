@@ -189,11 +189,46 @@ defmodule Nexora.Goals.GoalTracker do
   end
 
   defp seed_defaults do
-    create(%{id: "mission", title: "Build the best AI agent platform", type: :mission, priority: :critical, description: "Nexora mission: Create the most powerful, reliable, and developer-friendly AI agent command center"})
-    create(%{id: "obj-1", title: "Multi-model agent orchestration", type: :objective, parent_id: "mission", priority: :high, description: "Support all major LLM providers with seamless switching"})
-    create(%{id: "obj-2", title: "Enterprise-grade reliability", type: :objective, parent_id: "mission", priority: :high, description: "Leverage BEAM for fault tolerance and zero-downtime operations"})
-    create(%{id: "kr-1", title: "Support 10+ LLM providers", type: :key_result, parent_id: "obj-1", priority: :medium, progress: 40})
-    create(%{id: "kr-2", title: "99.99% agent uptime", type: :key_result, parent_id: "obj-2", priority: :high, progress: 80})
+    defaults = [
+      %{id: "mission", title: "Build the best AI agent platform", type: :mission, priority: :critical, description: "Nexora mission: Create the most powerful, reliable, and developer-friendly AI agent command center"},
+      %{id: "obj-1", title: "Multi-model agent orchestration", type: :objective, parent_id: "mission", priority: :high, description: "Support all major LLM providers with seamless switching"},
+      %{id: "obj-2", title: "Enterprise-grade reliability", type: :objective, parent_id: "mission", priority: :high, description: "Leverage BEAM for fault tolerance and zero-downtime operations"},
+      %{id: "kr-1", title: "Support 10+ LLM providers", type: :key_result, parent_id: "obj-1", priority: :medium, progress: 40},
+      %{id: "kr-2", title: "99.99% agent uptime", type: :key_result, parent_id: "obj-2", priority: :high, progress: 80}
+    ]
+
+    # Insert directly into ETS to avoid deadlock (GenServer.call inside init).
+    for attrs <- defaults do
+      goal = %Goal{
+        id: attrs[:id],
+        title: attrs[:title] || "Untitled Goal",
+        description: attrs[:description] || "",
+        type: attrs[:type] || :task,
+        parent_id: attrs[:parent_id],
+        owner_id: nil,
+        status: :active,
+        priority: attrs[:priority] || :medium,
+        progress: attrs[:progress] || 0,
+        due_date: nil,
+        metadata: %{},
+        created_at: DateTime.utc_now(),
+        updated_at: DateTime.utc_now()
+      }
+
+      :ets.insert(@table, {goal.id, goal})
+    end
+
+    # Wire up children after all goals are inserted.
+    for [{_, goal}] <- Enum.map(:ets.tab2list(@table), &[&1]) do
+      if goal.parent_id do
+        case :ets.lookup(@table, goal.parent_id) do
+          [{_, parent}] ->
+            updated = %{parent | children: [goal.id | parent.children] |> Enum.uniq()}
+            :ets.insert(@table, {parent.id, updated})
+          _ -> :ok
+        end
+      end
+    end
   end
 
   defp broadcast(event) do
