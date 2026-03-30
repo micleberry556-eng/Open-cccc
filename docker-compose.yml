@@ -1,0 +1,27 @@
+# Nexora — docker-compose for local / self-hosted deployment.
+# Start with:  docker compose up -d
+# Stop with:   docker compose down
+
+services:
+  nexora:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nexora
+    restart: unless-stopped
+    ports:
+      - "${NEXORA_PORT:-4000}:4000"
+    env_file:
+      - .env
+    environment:
+      # Required by Phoenix in production mode.
+      PHX_SERVER: "true"
+      PHX_HOST: "${PHX_HOST:-localhost}"
+      PORT: "4000"
+      SECRET_KEY_BASE: "${SECRET_KEY_BASE}"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

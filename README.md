@@ -83,28 +83,47 @@ The BEAM VM was designed for exactly this kind of workload -- massive concurrenc
 +----------------------------------------------------+
 ```
 
-## Quick Start
+## Quick Start (Docker — recommended)
 
-### Prerequisites
-- Erlang/OTP 25+
-- Elixir 1.14+
-- Node.js 18+ (for asset compilation)
-
-### Setup
+The fastest way to run Nexora on any Linux server or PC. Docker and all
+dependencies are installed automatically.
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/open_claw.git
-cd open_claw
+git clone https://github.com/micleberry556-eng/Open-cccc.git
+cd Open-cccc
 
-# Install dependencies
+# One-command install: installs Docker, generates secrets, builds & starts.
+chmod +x install.sh
+sudo ./install.sh
+```
+
+Open [http://localhost:4000](http://localhost:4000) to access the dashboard.
+
+To stop / start later:
+
+```bash
+docker compose down          # stop
+docker compose up -d         # start again
+```
+
+### Manual Docker Setup
+
+If Docker is already installed:
+
+```bash
+cp .env.example .env
+# Edit .env — at minimum set SECRET_KEY_BASE:
+#   openssl rand -base64 64 | tr -d '\n'
+docker compose up -d --build
+```
+
+### Development Setup (without Docker)
+
+Prerequisites: Erlang/OTP 25+, Elixir 1.14+, Node.js 18+.
+
+```bash
 mix setup
-
-# Set your API keys (optional - works without them)
-export ANTHROPIC_API_KEY="sk-ant-..."
-export OPENAI_API_KEY="sk-..."
-
-# Start the server
+export SECRET_KEY_BASE="$(openssl rand -base64 64 | tr -d '\n')"
 mix phx.server
 ```
 
@@ -112,17 +131,29 @@ Visit [`localhost:4000`](http://localhost:4000) to access the dashboard.
 
 ## Configuration
 
+All settings are managed through the `.env` file (see `.env.example` for the
+full list with descriptions). The `install.sh` script generates `.env`
+automatically on first run.
+
 ### Environment Variables
 
-| Variable | Description | Required |
-|----------|-------------|----------|
-| `ANTHROPIC_API_KEY` | Anthropic Claude API key | No |
-| `OPENAI_API_KEY` | OpenAI API key | No |
-| `GOOGLE_API_KEY` | Google Gemini API key | No |
-| `OLLAMA_URL` | Ollama server URL (default: localhost:11434) | No |
-| `SECRET_KEY_BASE` | Phoenix secret (required in prod) | Prod only |
-| `PHX_HOST` | Production hostname | Prod only |
-| `PORT` | HTTP port (default: 4000) | No |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `SECRET_KEY_BASE` | Phoenix secret for cookies/sessions | *generated* |
+| `PHX_HOST` | Hostname for generated URLs | `localhost` |
+| `NEXORA_PORT` | Port exposed on the host | `4000` |
+| `LOG_LEVEL` | Logging level (debug/info/warning/error) | `info` |
+| `MAX_AGENTS` | Max concurrent agent processes | `10` |
+| `HEARTBEAT_INTERVAL_SEC` | Agent heartbeat interval (seconds) | `30` |
+| `LLM_PROVIDER` | LLM backend: `local`, `ollama`, `openai` | `local` |
+| `LLM_API_KEY` | API key for cloud LLM providers | — |
+| `LLM_BASE_URL` | Custom LLM endpoint URL | — |
+| `LLM_MODEL` | Model name (gpt-4, llama3, mistral, ...) | — |
+| `BUDGET_LIMIT_USD` | Monthly budget cap (0 = unlimited) | `0` |
+| `AUTH_ENABLED` | Require login for web UI | `false` |
+| `ADMIN_USERNAME` | Admin login | `admin` |
+| `ADMIN_PASSWORD` | Admin password | — |
+| `ALLOWED_IPS` | Comma-separated IP allowlist | — |
 
 ## Tech Stack
 
